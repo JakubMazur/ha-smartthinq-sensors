@@ -539,6 +539,29 @@ class CoreAsync:
 
         return result
 
+    async def _get_emp_signature(self, login_base_url: str, message: str) -> str:
+        """Get the EMP request signature from the LG login server."""
+        sign_url = urljoin(login_base_url, "signature")
+        params = {
+            "kind": "oauth2",
+            "key_name": "OAUTH_SECRETKEY",
+            "sever_type": "OP",
+            "timestamp": message,
+        }
+        async with self._get_session().get(
+            url=sign_url,
+            params=params,
+            timeout=self._timeout,
+            raise_for_status=False,
+        ) as resp:
+            signature = (await resp.text()).strip()
+            status = resp.status
+
+        if status != 200 or not signature or len(signature) > 64:
+            _LOGGER.debug("get_emp_signature - invalid response: %s", status)
+            raise exc.AuthenticationError("Unable to get login signature")
+        return signature
+
     async def auth_user_login(
         self,
         login_base_url: str,
@@ -629,21 +652,6 @@ class CoreAsync:
 
         account = account_data["account"]
 
-        # dynamic get secret key for emp signature
-        emp_search_key_url = urljoin(
-            login_base_url, "searchKey?key_name=OAUTH_SECRETKEY&sever_type=OP"
-        )
-
-        async with self._get_session().get(
-            url=emp_search_key_url, timeout=self._timeout, raise_for_status=False
-        ) as resp:
-            secret_data = json.loads(
-                await resp.text()
-            )  # this return data as plain/text
-
-        _LOGGER.debug("auth_user_login - secret_data: %s", secret_data)
-        secret_key = secret_data["returnData"]
-
         # get token data
         emp_data = {
             "account_type": account["userIDType"],
@@ -655,7 +663,12 @@ class CoreAsync:
         parse_url = urlparse(V2_EMP_SESS_URL)
         timestamp = datetime.now(timezone.utc).strftime(DATE_FORMAT)
         req_url = f"{parse_url.path}?{urlencode(emp_data)}"
-        signature = self._oauth2_signature(f"{req_url}\n{timestamp}", secret_key)
+
+        # LG removed the searchKey endpoint: the signature is now computed by the
+        # login server itself (returned as plain text base64 HMAC-SHA1)
+        signature = await self._get_emp_signature(
+            login_base_url, f"{req_url}\n{timestamp}"
+        )
 
         emp_headers = {
             "lgemp-x-app-key": OAUTH_CLIENT_KEY,
@@ -855,7 +868,7 @@ class Gateway:
                 fragment=None,
             )
         )
-        url_netloc = OAUTH_LOGIN_HOST
+        url_netloc = url_base_parsed.hostname or OAUTH_LOGIN_HOST
         if url_base_parsed.port:
             url_netloc += f":{url_base_parsed.port}"
 
